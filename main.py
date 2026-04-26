@@ -84,6 +84,7 @@ state = {
     "last_scan":     0,
     "start_time":    int(time.time()),
     "errors":        [],
+    "manual_paused": False,  # user-controlled pause from dashboard
 }
 
 # ── BYBIT API ────────────────────────────────────────────────
@@ -491,6 +492,20 @@ def _log_error(msg):
     state["errors"] = state["errors"][:10]
     print(f"ERROR: {msg}")
 
+def _log_scan_detail(symbol, tqi, reason, er=None, st=None, flip=False):
+    """Log per-coin scan result with scores to scan_detail list."""
+    entry = {
+        "time":   int(time.time()),
+        "symbol": symbol,
+        "tqi":    tqi,
+        "er":     er,
+        "st":     st,
+        "flip":   flip,
+        "reason": reason,
+    }
+    state["scan_detail"].insert(0, entry)
+    state["scan_detail"] = state["scan_detail"][:30]
+
 # ── SUPABASE LOGGING ─────────────────────────────────────────
 
 async def sb_save(trade, result):
@@ -563,10 +578,32 @@ async def scan_symbol(symbol):
     if len(candles) < CANDLES_NEEDED:
         return False
 
+    # Always compute TQI to show scores in scan log
+    closes   = [float(c[4]) for c in candles]
+    highs    = [float(c[2]) for c in candles]
+    lows     = [float(c[3]) for c in candles]
+    vols     = [float(c[5]) for c in candles]
+    atr_vals = _calc_atr(candles, ATR_LEN)
+    er_vals  = _calc_er(closes, ER_LEN)
+    vol_z    = _calc_vol_z(vols, 20)
+    tqi_vals = _calc_tqi(candles, er_vals, vol_z)
+    st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+    i        = len(candles) - 1
+    tqi      = round(tqi_vals[i], 3)
+    er       = round(er_vals[i], 3)
+    flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
+    st_state = "BULL" if st_dir[i] == -1 else "BEAR"
+
     # Compute SATS signal
     signal = compute_sats_signal(candles)
     if signal is None:
+        reason = "TQI LOW" if flip_up else "NO FLIP"
+        _log_scan_detail(symbol, tqi, reason, er=er, st=st_state, flip=flip_up)
         return False
+
+    # Log signal found
+    _log_scan_detail(symbol, signal["tqi"], "SIGNAL ✅",
+                     er=er, st="BULL", flip=True)
 
     # Check daily DD protection
     if not check_daily_dd():
@@ -701,6 +738,16 @@ async def close_trade(pos, exit_price, result, exit_type):
     )
     await sb_save(trade, result)
 
+# ── TOGGLE ENDPOINT ─────────────────────────────────────────
+
+@app.post("/api/toggle")
+async def toggle_bot():
+    state["manual_paused"] = not state["manual_paused"]
+    status = "paused" if state["manual_paused"] else "running"
+    state["status"] = status
+    _log_scan(f"Bot manually {'PAUSED' if state['manual_paused'] else 'RESUMED'} via dashboard")
+    return {"paused": state["manual_paused"], "status": status}
+
 # ── MAIN BOT LOOP ────────────────────────────────────────────
 
 async def bot_loop():
@@ -733,7 +780,7 @@ async def bot_loop():
 
             # Scan for new signals
             slots = MAX_POS - len(state["positions"])
-            if slots > 0 and not state["dd_paused"]:
+            if slots > 0 and not state["dd_paused"] and not state["manual_paused"]:
                 _log_scan(
                     f"Scanning {len(COINS)} coins | "
                     f"Balance=${state['balance']:.2f} | "
@@ -908,6 +955,40 @@ async def dashboard():
     if state["dd_paused"]:
         resume = state["dd_pause_until"] - int(time.time())
         dd_warning = f'<div class="dd-warning">⚠️ Daily DD limit hit — paused {resume//3600:.0f}h {(resume%3600)//60:.0f}m</div>'
+    if state["manual_paused"]:
+        dd_warning += '<div class="manual-warning">⏸ Bot manually paused — click RESUME to restart scanning</div>'
+
+    # Build scan detail log HTML
+    scan_detail_html = ""
+    for s in state["scan_detail"][:15]:
+        age_s   = int(time.time()) - s.get("time", int(time.time()))
+        age_str = f"{age_s//60}m" if age_s >= 60 else f"{age_s}s"
+        sym     = s.get("symbol","").replace("USDT","")
+        tqi     = s.get("tqi")
+        er      = s.get("er")
+        reason  = s.get("reason","")
+        st      = s.get("st","")
+        flip    = s.get("flip", False)
+        tqi_str = f"{tqi:.3f}" if tqi is not None else "—"
+        er_str  = f"{er:.3f}" if er is not None else "—"
+        if "SIGNAL" in reason:
+            row_col = "#16a34a"; bg = "#f0fdf4"
+        elif flip:
+            row_col = "#ca8a04"; bg = "#fefce8"
+        else:
+            row_col = "#888"; bg = "transparent"
+        tqi_col = "#16a34a" if tqi and tqi >= 0.6 else "#ef4444" if tqi else "#888"
+        scan_detail_html += f'''
+        <div class="scan-row" style="background:{bg}">
+          <span class="scan-sym">{sym}</span>
+          <span class="scan-st" style="color:{'#16a34a' if st=='BULL' else '#ef4444'};font-size:10px">{st}</span>
+          <span class="scan-tqi">TQI <b style="color:{tqi_col}">{tqi_str}</b></span>
+          <span class="scan-er" style="color:#888;font-size:10px">ER {er_str}</span>
+          <span class="scan-reason" style="color:{row_col};font-weight:600;font-size:11px">{reason}</span>
+          <span class="age">{age_str}</span>
+        </div>'''
+    if not scan_detail_html:
+        scan_detail_html = '<div class="empty">Scanning...</div>'
 
     html = f"""<!DOCTYPE html>
 <html><head>
@@ -958,6 +1039,10 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
   <div class="status"><span class="dot"></span>{state["status"].upper()}</div>
 </div>
 {dd_warning}
+<button class="toggle-btn {'btn-pause' if not state['manual_paused'] else 'btn-resume'}"
+  onclick="fetch('/api/toggle',{{method:'POST'}}).then(()=>location.reload())">
+  {'⏸ PAUSE BOT' if not state['manual_paused'] else '▶ RESUME BOT'}
+</button>
 <div class="grid">
   <div class="card">
     <div class="card-label">Total P&L</div>
@@ -993,6 +1078,8 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 </div>
 <div class="sec-title">Open Positions</div>
 {pos_html}
+<div class="sec-title">Scan Log — Per Coin Scores</div>
+<div class="card">{scan_detail_html}</div>
 <div class="sec-title">Activity Log</div>
 <div class="card">{log_html}</div>
 <div class="sec-title">Recent Trades</div>
