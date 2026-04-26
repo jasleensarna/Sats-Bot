@@ -43,7 +43,7 @@ COINS      = ["SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT"]
 MAX_POS    = 2        # max concurrent positions
 RISK_PCT   = 5.0      # % of balance per trade
 DAILY_DD_LIMIT = 10.0 # pause if daily drawdown exceeds this %
-SCAN_INTERVAL  = 300  # seconds between scans (5 min)
+SCAN_INTERVAL  = 60   # seconds between scans (1 min — faster score updates)
 
 # ── SATS Parameters ───────────────────────────────────────────
 ATR_LEN        = 14
@@ -569,13 +569,10 @@ async def scan_symbol(symbol):
     Scan one symbol for SATS signal.
     Returns True if a trade was entered.
     """
-    # Skip if already in position
-    if symbol in state["positions"]:
-        return False
-
-    # Fetch 1h candles
+    # Fetch 1h candles first so we always get scores
     candles = await get_klines(symbol, "60", 220)
     if len(candles) < CANDLES_NEEDED:
+        _log_scan_detail(symbol, None, "NO DATA")
         return False
 
     # Always compute TQI to show scores in scan log
@@ -593,6 +590,11 @@ async def scan_symbol(symbol):
     er       = round(er_vals[i], 3)
     flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
     st_state = "BULL" if st_dir[i] == -1 else "BEAR"
+
+    # Skip if already in position (but still log the score)
+    if symbol in state["positions"]:
+        _log_scan_detail(symbol, tqi, "IN TRADE", er=er, st=st_state, flip=flip_up)
+        return False
 
     # Compute SATS signal
     signal = compute_sats_signal(candles)
@@ -752,6 +754,9 @@ async def toggle_bot():
 
 async def bot_loop():
     print("APEX Pro v5 starting...")
+    # Ensure all state keys exist (safe for hot-reloads)
+    state.setdefault("manual_paused", False)
+    state.setdefault("scan_detail", [])
     await sb_load()
 
     state["balance"]       = await get_balance()
