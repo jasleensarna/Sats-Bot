@@ -952,6 +952,10 @@ async def dashboard():
         trades_html = '<div class="empty">No trades yet</div>'
 
     dd_warning = ""
+    # Pre-compute toggle values (avoid nested quotes in f-string)
+    is_paused     = state["manual_paused"]
+    btn_class     = "toggle-btn btn-pause" if not is_paused else "toggle-btn btn-resume"
+    btn_label     = "⏸  PAUSE BOT" if not is_paused else "▶  RESUME BOT"
     if state["dd_paused"]:
         resume = state["dd_pause_until"] - int(time.time())
         dd_warning = f'<div class="dd-warning">⚠️ Daily DD limit hit — paused {resume//3600:.0f}h {(resume%3600)//60:.0f}m</div>'
@@ -960,7 +964,7 @@ async def dashboard():
 
     # Build scan detail log HTML
     scan_detail_html = ""
-    for s in state["scan_detail"][:15]:
+    for s in state.get("scan_detail", [])[:15]:
         age_s   = int(time.time()) - s.get("time", int(time.time()))
         age_str = f"{age_s//60}m" if age_s >= 60 else f"{age_s}s"
         sym     = s.get("symbol","").replace("USDT","")
@@ -1039,10 +1043,7 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
   <div class="status"><span class="dot"></span>{state["status"].upper()}</div>
 </div>
 {dd_warning}
-<button class="toggle-btn {'btn-pause' if not state['manual_paused'] else 'btn-resume'}"
-  onclick="fetch('/api/toggle',{{method:'POST'}}).then(()=>location.reload())">
-  {'⏸ PAUSE BOT' if not state['manual_paused'] else '▶ RESUME BOT'}
-</button>
+<button class="{btn_class}" onclick="fetch('/api/toggle',{{method:'POST'}}).then(()=>location.reload())">{btn_label}</button>
 <div class="grid">
   <div class="card">
     <div class="card-label">Total P&L</div>
