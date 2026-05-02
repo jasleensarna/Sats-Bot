@@ -742,6 +742,15 @@ async def close_trade(pos, exit_price, result, exit_type):
 
 # ── TOGGLE ENDPOINT ─────────────────────────────────────────
 
+@app.post("/api/reset_dd")
+async def reset_dd():
+    """Manually clear the DD pause — use if timer gets stuck."""
+    state["dd_paused"]      = False
+    state["dd_pause_until"] = 0
+    state["balance_start"]  = state["balance"]
+    _log_scan("DD pause manually cleared via dashboard")
+    return {"ok": True, "msg": "DD pause cleared"}
+
 @app.post("/api/toggle")
 async def toggle_bot():
     state["manual_paused"] = not state["manual_paused"]
@@ -782,6 +791,9 @@ async def bot_loop():
                     for sym, pos in list(state["positions"].items())
                 ]
                 await asyncio.gather(*tasks)
+
+            # Always check DD timer — this is what lifts the pause
+            check_daily_dd()
 
             # Scan for new signals
             slots = MAX_POS - len(state["positions"])
