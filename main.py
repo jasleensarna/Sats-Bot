@@ -751,6 +751,79 @@ async def reset_dd():
     _log_scan("DD pause manually cleared via dashboard")
     return {"ok": True, "msg": "DD pause cleared"}
 
+@app.get("/api/score/{symbol}")
+async def get_score(symbol: str):
+    """Calculate SATS scores for any coin on demand."""
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+    try:
+        candles = await get_klines(symbol, "60", 220)
+        if len(candles) < 50:
+            return JSONResponse({"error": f"Not enough data for {symbol} — only {len(candles)} candles"})
+
+        closes = [float(c[4]) for c in candles]
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
+        vols   = [float(c[5]) for c in candles]
+
+        atr_vals = _calc_atr(candles, ATR_LEN)
+        er_vals  = _calc_er(closes, ER_LEN)
+        vol_z    = _calc_vol_z(vols, 20)
+        tqi_vals = _calc_tqi(candles, er_vals, vol_z)
+        st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+
+        i        = len(candles) - 1
+        tqi      = round(tqi_vals[i], 3)
+        er       = round(er_vals[i], 3)
+        atr      = round(atr_vals[i], 6)
+        flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
+        flip_dn  = st_dir[i] == 1  and st_dir[i-1] == -1
+        st_state = "BULL" if st_dir[i] == -1 else "BEAR"
+        price    = closes[i]
+
+        # SL/TP if signal
+        pivot_lo = _calc_pivots(highs, lows, PIVOT_LEN)
+        last_pl  = next((pivot_lo[j] for j in range(i-1, max(0,i-50), -1)
+                         if pivot_lo[j] is not None), None)
+        sl = tp = risk_pct = None
+        if flip_up and tqi >= TQI_MIN:
+            sl_base = last_pl if last_pl else lows[i]
+            sl      = min(sl_base - SL_ATR_MULT*atr_vals[i], price - SL_ATR_MULT*atr_vals[i])
+            risk    = price - sl
+            tp      = price + risk * TP_R
+            risk_pct= round(risk/price*100, 3)
+
+        if flip_up and tqi >= TQI_MIN:
+            signal = "✅ LONG SIGNAL"
+        elif flip_up:
+            signal = f"⚠️ FLIP UP but TQI {tqi} < {TQI_MIN}"
+        elif flip_dn:
+            signal = "🔻 FLIPPED BEAR"
+        elif st_state == "BULL":
+            signal = "📈 BULL — waiting for next flip"
+        else:
+            signal = "📉 BEAR — no signal"
+
+        return JSONResponse({
+            "symbol":   symbol,
+            "price":    round(price, 8),
+            "candles":  len(candles),
+            "st":       st_state,
+            "tqi":      tqi,
+            "er":       er,
+            "atr":      atr,
+            "flip_up":  flip_up,
+            "flip_dn":  flip_dn,
+            "signal":   signal,
+            "tqi_pass": tqi >= TQI_MIN,
+            "sl":       round(sl, 8) if sl else None,
+            "tp":       round(tp, 8) if tp else None,
+            "risk_pct": risk_pct,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
 @app.post("/api/toggle")
 async def toggle_bot():
     state["manual_paused"] = not state["manual_paused"]
@@ -881,6 +954,79 @@ async def debug_balance():
         except Exception as e:
             results[acct] = {"error": str(e)}
     return JSONResponse(results)
+
+# ── COIN CHECKER ─────────────────────────────────────────────
+
+@app.get("/api/check/{symbol}")
+async def check_coin(symbol: str):
+    """Calculate SATS scores for any coin on demand."""
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+
+    candles = await get_klines(symbol, "60", 220)
+    if not candles or len(candles) < 50:
+        return JSONResponse({"error": f"Not enough data for {symbol} ({len(candles)} candles)"})
+
+    closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
+    vols   = [float(c[5]) for c in candles]
+
+    atr_vals = _calc_atr(candles, ATR_LEN)
+    er_vals  = _calc_er(closes, ER_LEN)
+    vol_z    = _calc_vol_z(vols, 20)
+    tqi_vals = _calc_tqi(candles, er_vals, vol_z)
+    st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+
+    i        = len(candles) - 1
+    tqi      = round(tqi_vals[i], 3)
+    er       = round(er_vals[i], 3)
+    atr      = round(atr_vals[i], 8)
+    price    = round(closes[i], 8)
+    flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
+    flip_dn  = st_dir[i] == 1  and st_dir[i-1] == -1
+    st_state = "BULL" if st_dir[i] == -1 else "BEAR"
+
+    # SL/TP if signal fired
+    sl = tp = risk_pct = None
+    if flip_up and tqi >= TQI_MIN:
+        atr_v  = atr_vals[i]
+        sl_val = price - SL_ATR_MULT * atr_v
+        risk   = price - sl_val
+        tp_val = price + risk * TP_R
+        sl     = round(sl_val, 8)
+        tp     = round(tp_val, 8)
+        risk_pct = round(risk / price * 100, 3)
+
+    if flip_up and tqi >= TQI_MIN:
+        status = "SIGNAL ✅"
+    elif flip_up:
+        status = f"FLIP but TQI {tqi} < 0.6 — blocked"
+    elif flip_dn:
+        status = "Flipped BEAR — no entry"
+    elif st_state == "BULL" and tqi >= TQI_MIN:
+        status = "BULL trend, TQI OK — waiting for flip"
+    elif tqi < TQI_MIN:
+        status = f"TQI {tqi} too low — choppy market"
+    else:
+        status = "No signal"
+
+    return JSONResponse({
+        "symbol":   symbol,
+        "price":    price,
+        "candles":  len(candles),
+        "st":       st_state,
+        "tqi":      tqi,
+        "er":       er,
+        "atr":      atr,
+        "flip":     "BULL" if flip_up else "BEAR" if flip_dn else "NONE",
+        "tqi_pass": tqi >= TQI_MIN,
+        "status":   status,
+        "sl":       sl,
+        "tp":       tp,
+        "risk_pct": risk_pct,
+    })
 
 # ── DASHBOARD ─────────────────────────────────────────────────
 
@@ -1061,6 +1207,7 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 </div>
 {dd_warning}
 <button class="{btn_class}" onclick="fetch('/api/toggle',{{method:'POST'}}).then(()=>location.reload())">{btn_label}</button>
+<button class="toggle-btn" style="background:#f59e0b;color:#fff;margin-top:8px" onclick="fetch('/api/reset_dd',{{method:'POST'}}).then(()=>location.reload())">🔓 CLEAR DD PAUSE</button>
 <div class="grid">
   <div class="card">
     <div class="card-label">Total P&L</div>
@@ -1102,7 +1249,73 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 <div class="card">{log_html}</div>
 <div class="sec-title">Recent Trades</div>
 <div class="card">{trades_html}</div>
+<div class="sec-title">Coin Score Checker</div>
+<div class="card">
+  <div style="display:flex;gap:8px;margin-bottom:12px">
+    <input id="coinInput" type="text" placeholder="e.g. B3, SOL, AVAX"
+      style="flex:1;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px;
+             font-size:14px;outline:none;font-family:inherit"
+      onkeydown="if(event.key==='Enter')checkCoin()">
+    <button onclick="checkCoin()"
+      style="background:#1a1a1a;color:#fff;border:none;padding:10px 16px;
+             border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">
+      Check
+    </button>
+  </div>
+  <div id="scoreResult" style="font-size:13px;color:#888">
+    Enter any Bybit USDT perpetual coin above
+  </div>
+</div>
 <div class="refresh">Auto-refreshes every 30s</div>
+<script>
+async function checkCoin() {{
+  const sym = document.getElementById('coinInput').value.trim().toUpperCase();
+  if (!sym) return;
+  const el = document.getElementById('scoreResult');
+  el.innerHTML = '<span style="color:#888">Calculating...</span>';
+  try {{
+    const r = await fetch('/api/score/' + sym);
+    const d = await r.json();
+    if (d.error) {{
+      el.innerHTML = '<span style="color:#ef4444">⚠️ ' + d.error + '</span>';
+      return;
+    }}
+    const tqiCol  = d.tqi_pass ? '#16a34a' : '#ef4444';
+    const stCol   = d.st === 'BULL' ? '#16a34a' : '#ef4444';
+    const sigCol  = d.signal.includes('✅') ? '#16a34a' :
+                    d.signal.includes('⚠️') ? '#ca8a04' : '#ef4444';
+    let html = '<div style="border-top:1px solid #f0f0f0;padding-top:10px">';
+    html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px">';
+    html += '<b style="font-size:15px">' + d.symbol + '</b>';
+    html += '<span style="color:#888;font-size:12px">' + d.candles + ' candles</span></div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+    html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">Supertrend</span>';
+    html += '<div style="font-weight:700;color:' + stCol + '">' + d.st;
+    if (d.flip_up) html += ' ↑ FLIPPED';
+    if (d.flip_dn) html += ' ↓ FLIPPED';
+    html += '</div></div>';
+    html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">TQI</span>';
+    html += '<div style="font-weight:700;font-size:18px;color:' + tqiCol + '">' + d.tqi;
+    html += '<span style="font-size:11px;margin-left:4px">' + (d.tqi_pass ? '✓ PASS' : '✗ LOW') + '</span></div></div>';
+    html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">ER</span>';
+    html += '<div style="font-weight:600">' + d.er + '<span style="color:#888;font-size:11px;margin-left:4px">' + (d.er > 0.4 ? 'trending' : 'choppy') + '</span></div></div>';
+    html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">Price</span>';
+    html += '<div style="font-weight:600">' + d.price + '</div></div>';
+    html += '</div>';
+    html += '<div style="background:#f8f8f8;border-radius:8px;padding:10px;font-weight:700;color:' + sigCol + '">' + d.signal + '</div>';
+    if (d.sl) {{
+      html += '<div style="margin-top:8px;font-size:12px;color:#888">';
+      html += 'SL: <b style="color:#ef4444">' + d.sl + '</b> &nbsp;';
+      html += 'TP: <b style="color:#16a34a">' + d.tp + '</b> &nbsp;';
+      html += 'Risk: <b>' + d.risk_pct + '%</b></div>';
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }} catch(e) {{
+    el.innerHTML = '<span style="color:#ef4444">Error: ' + e.message + '</span>';
+  }}
+}}
+</script>
 <meta http-equiv="refresh" content="30">
 </body></html>"""
 
