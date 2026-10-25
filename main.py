@@ -2,14 +2,14 @@
 APEX Pro v5 — Production Bot
 ════════════════════════════════════════════════════════════════
 Strategy: SATS Long-Only (Self-Aware Trend System)
-Signal:   Adaptive Supertrend flip up + TQI ≥ 0.6
-Coins:    SOL, XRP, DOGE, ADA, AVAX
+Signal:   Adaptive Supertrend flip up + TQI ≥ 0.63
+Coins:    SOL, XRP, DOGE, AVAX, BNB, LINK
 Direction: Long only
 Timeframe: 1h candles
 SL:        1.5x ATR below pivot low
 TP:        1R (1x risk distance)
-Risk:      5% of balance per trade
-Max pos:   2 concurrent
+Risk:      5% of balance per trade (hard cap $2.50/trade)
+Max pos:   1 concurrent
 Daily DD:  -10% → pause 24h
 
 Backtested: 75% WR | +3.08% exp | 4.05x PF | -9.8% DD
@@ -39,9 +39,10 @@ BASE       = "https://api.bybit.com"
 SB_URL     = os.getenv("SUPABASE_URL", "")
 SB_KEY     = os.getenv("SUPABASE_KEY", "")
 
-COINS      = ["SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT"]
-MAX_POS    = 2        # max concurrent positions
+COINS      = ["SOLUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","BNBUSDT","LINKUSDT"]
+MAX_POS    = 1        # max concurrent positions (1 = no double-loss events)
 RISK_PCT   = 5.0      # % of balance per trade
+MAX_RISK_USD = 2.50   # hard cap: max dollar loss per trade regardless of balance
 DAILY_DD_LIMIT = 10.0 # pause if daily drawdown exceeds this %
 SCAN_INTERVAL  = 60   # seconds between scans (1 min — faster score updates)
 
@@ -52,7 +53,7 @@ ER_LEN         = 20
 SL_ATR_MULT    = 1.5
 ATR_BASELINE   = 100
 ADAPT_STRENGTH = 0.5
-TQI_MIN        = 0.60
+TQI_MIN        = 0.63
 TP_R           = 1.0
 TQI_ER_W       = 0.35
 TQI_VOL_W      = 0.20
@@ -85,6 +86,8 @@ state = {
     "start_time":    int(time.time()),
     "errors":        [],
     "manual_paused": False,  # user-controlled pause from dashboard
+    "btc_regime":    "UNKNOWN",  # BTC 4h Supertrend: BULL / BEAR / UNKNOWN
+    "btc_regime_ts": 0,          # last time BTC regime was checked
 }
 
 # ── BYBIT API ────────────────────────────────────────────────
@@ -143,6 +146,38 @@ async def get_klines(symbol, interval="60", limit=220):
     except Exception as e:
         _log_error(f"get_klines {symbol}: {e}")
     return []
+
+async def update_btc_regime():
+    """
+    Fetch BTC 4h candles and compute Supertrend direction.
+    Sets state['btc_regime'] to 'BULL' or 'BEAR'.
+    Only allow new longs when BTC 4h is BULL — filters out macro dump entries.
+    Called once per loop cycle (cached for 4h between updates for efficiency).
+    """
+    now = int(time.time())
+    # Re-check at most every 15 min (4h candle closes every 4h, 15min is fine)
+    if now - state["btc_regime_ts"] < 900 and state["btc_regime"] != "UNKNOWN":
+        return
+
+    try:
+        candles = await get_klines("BTCUSDT", "240", 100)  # 4h candles
+        if len(candles) < 30:
+            return
+
+        atr_vals = _calc_atr(candles, ATR_LEN)
+        er_vals  = _calc_er([float(c[4]) for c in candles], ER_LEN)
+        vols     = [float(c[5]) for c in candles]
+        vol_z    = _calc_vol_z(vols, 20)
+        tqi_vals = _calc_tqi(candles, er_vals, vol_z)
+        st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+
+        # -1 = BULL (price above supertrend line), 1 = BEAR
+        regime = "BULL" if st_dir[-1] == -1 else "BEAR"
+        state["btc_regime"]    = regime
+        state["btc_regime_ts"] = now
+        _log_scan(f"BTC 4h regime: {regime}")
+    except Exception as e:
+        _log_error(f"update_btc_regime: {e}")
 
 async def get_ticker(symbol):
     try:
@@ -363,10 +398,19 @@ def _calc_pivots(highs, lows, pl):
 
 # ── SATS SIGNAL ───────────────────────────────────────────────
 
+def _calc_pivot_highs(highs, pl):
+    """Pivot highs — mirror of _calc_pivots for lows."""
+    n   = len(highs)
+    phi = [None] * n
+    for i in range(pl, n - pl):
+        if highs[i] == max(highs[i-pl:i+pl+1]):
+            phi[i] = highs[i]
+    return phi
+
 def compute_sats_signal(candles):
     """
-    Returns dict with signal info or None if no signal.
-    Signal = Supertrend flips from bearish to bullish AND TQI ≥ 0.6
+    Returns dict with LONG signal info or None.
+    Signal = Supertrend flips BEAR→BULL AND TQI ≥ TQI_MIN
     """
     if len(candles) < CANDLES_NEEDED:
         return None
@@ -383,11 +427,9 @@ def compute_sats_signal(candles):
     st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
     pivot_lo = _calc_pivots(highs, lows, PIVOT_LEN)
 
-    i = len(candles) - 1  # current bar
+    i = len(candles) - 1
 
-    # Check for Supertrend flip up on current bar
     flip_up = st_dir[i] == -1 and st_dir[i-1] == 1
-
     if not flip_up:
         return None
 
@@ -395,7 +437,6 @@ def compute_sats_signal(candles):
     if tqi < TQI_MIN:
         return None
 
-    # Find last pivot low for SL
     last_pl = None
     for j in range(i-1, max(0, i-50), -1):
         if pivot_lo[j] is not None:
@@ -406,8 +447,7 @@ def compute_sats_signal(candles):
     price = closes[i]
 
     sl_base = last_pl if last_pl else lows[i]
-    sl      = min(sl_base - SL_ATR_MULT * atr,
-                  price   - SL_ATR_MULT * atr)
+    sl      = min(sl_base - SL_ATR_MULT * atr, price - SL_ATR_MULT * atr)
     risk    = price - sl
     if risk <= 0:
         return None
@@ -415,6 +455,68 @@ def compute_sats_signal(candles):
     tp = price + risk * TP_R
 
     return {
+        "side":    "long",
+        "price":   round(price, 6),
+        "sl":      round(sl, 6),
+        "tp":      round(tp, 6),
+        "risk":    round(risk, 6),
+        "atr":     round(atr, 6),
+        "tqi":     round(tqi, 3),
+        "sl_pct":  round(risk / price * 100, 3),
+    }
+
+def compute_sats_short_signal(candles):
+    """
+    Returns dict with SHORT signal info or None.
+    Signal = Supertrend flips BULL→BEAR AND TQI ≥ TQI_MIN
+    SL placed above pivot HIGH + 1.5x ATR. TP = entry - 1R.
+    """
+    if len(candles) < CANDLES_NEEDED:
+        return None
+
+    closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
+    vols   = [float(c[5]) for c in candles]
+
+    atr_vals = _calc_atr(candles, ATR_LEN)
+    er_vals  = _calc_er(closes, ER_LEN)
+    vol_z    = _calc_vol_z(vols, 20)
+    tqi_vals = _calc_tqi(candles, er_vals, vol_z)
+    st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+    pivot_hi = _calc_pivot_highs(highs, PIVOT_LEN)
+
+    i = len(candles) - 1
+
+    # Supertrend flip BULL→BEAR (direction goes from -1 to 1)
+    flip_down = st_dir[i] == 1 and st_dir[i-1] == -1
+    if not flip_down:
+        return None
+
+    tqi = tqi_vals[i]
+    if tqi < TQI_MIN:
+        return None
+
+    # Find last pivot high for SL
+    last_ph = None
+    for j in range(i-1, max(0, i-50), -1):
+        if pivot_hi[j] is not None:
+            last_ph = pivot_hi[j]
+            break
+
+    atr   = atr_vals[i]
+    price = closes[i]
+
+    sl_base = last_ph if last_ph else highs[i]
+    sl      = max(sl_base + SL_ATR_MULT * atr, price + SL_ATR_MULT * atr)
+    risk    = sl - price
+    if risk <= 0:
+        return None
+
+    tp = price - risk * TP_R  # profit target is below entry for shorts
+
+    return {
+        "side":    "short",
         "price":   round(price, 6),
         "sl":      round(sl, 6),
         "tp":      round(tp, 6),
@@ -427,8 +529,8 @@ def compute_sats_signal(candles):
 # ── POSITION SIZING ───────────────────────────────────────────
 
 def calc_position_size(balance, sl_pct, price, step, min_qty):
-    """Risk 5% of balance. Position = risk_amount / sl_distance."""
-    risk_amount  = balance * (RISK_PCT / 100)
+    """Risk 5% of balance, hard-capped at MAX_RISK_USD. Position = risk_amount / sl_distance."""
+    risk_amount  = min(balance * (RISK_PCT / 100), MAX_RISK_USD)  # cap at $2.50 max loss
     sl_distance  = sl_pct / 100  # as decimal
     if sl_distance <= 0:
         return 0
@@ -588,24 +690,44 @@ async def scan_symbol(symbol):
     i        = len(candles) - 1
     tqi      = round(tqi_vals[i], 3)
     er       = round(er_vals[i], 3)
-    flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
-    st_state = "BULL" if st_dir[i] == -1 else "BEAR"
+    flip_up   = st_dir[i] == -1 and st_dir[i-1] == 1
+    flip_down = st_dir[i] == 1  and st_dir[i-1] == -1
+    st_state  = "BULL" if st_dir[i] == -1 else "BEAR"
 
     # Skip if already in position (but still log the score)
     if symbol in state["positions"]:
         _log_scan_detail(symbol, tqi, "IN TRADE", er=er, st=st_state, flip=flip_up)
         return False
 
-    # Compute SATS signal
-    signal = compute_sats_signal(candles)
+    # BTC regime determines direction allowed
+    btc = state.get("btc_regime", "UNKNOWN")
+    allow_long  = btc in ("BULL", "UNKNOWN")
+    allow_short = btc in ("BEAR", "UNKNOWN")
+
+    # Try LONG signal first (BTC BULL regime)
+    signal = None
+    if allow_long:
+        signal = compute_sats_signal(candles)
+
+    # Try SHORT signal if no long (BTC BEAR regime)
+    if signal is None and allow_short:
+        signal = compute_sats_short_signal(candles)
+
     if signal is None:
-        reason = "TQI LOW" if flip_up else "NO FLIP"
-        _log_scan_detail(symbol, tqi, reason, er=er, st=st_state, flip=flip_up)
+        if flip_up and not allow_long:
+            reason = "LONG BLOCKED (BTC BEAR)"
+        elif flip_down and not allow_short:
+            reason = "SHORT BLOCKED (BTC BULL)"
+        elif flip_up or flip_down:
+            reason = "TQI LOW"
+        else:
+            reason = "NO FLIP"
+        _log_scan_detail(symbol, tqi, reason, er=er, st=st_state, flip=flip_up or flip_down)
         return False
 
-    # Log signal found
-    _log_scan_detail(symbol, signal["tqi"], "SIGNAL ✅",
-                     er=er, st="BULL", flip=True)
+    side_label = "LONG 📈" if signal["side"] == "long" else "SHORT 📉"
+    _log_scan_detail(symbol, signal["tqi"], f"SIGNAL ✅ {side_label}",
+                     er=er, st=st_state, flip=True)
 
     # Check daily DD protection
     if not check_daily_dd():
@@ -636,7 +758,7 @@ async def scan_symbol(symbol):
         return False
 
     # Place order
-    resp = await place_order(symbol, "long", qty, signal["sl"])
+    resp = await place_order(symbol, signal["side"], qty, signal["sl"])
     if not resp or resp.get("retCode") != 0:
         _log_error(f"ORDER FAIL {symbol}: {resp}")
         return False
@@ -644,7 +766,7 @@ async def scan_symbol(symbol):
     # Record position
     state["positions"][symbol] = {
         "symbol":    symbol,
-        "side":      "long",
+        "side":      signal["side"],
         "entry":     signal["price"],
         "sl":        signal["sl"],
         "tp":        signal["tp"],
@@ -657,7 +779,7 @@ async def scan_symbol(symbol):
     }
 
     _log_scan(
-        f"  ✅ ENTERED {symbol} LONG @ {signal['price']} "
+        f"  ✅ ENTERED {symbol} {signal['side'].upper()} @ {signal['price']} "
         f"| SL={signal['sl']} | TP={signal['tp']} "
         f"| TQI={signal['tqi']} | Qty={qty}"
     )
@@ -674,7 +796,14 @@ async def monitor_position(symbol, pos):
         return
 
     price = float(ticker.get("lastPrice", pos["entry"]))
-    pnl_pct = (price - pos["entry"]) / pos["entry"] * 100
+    side  = pos.get("side", "long")
+    entry = pos["entry"]
+
+    # PnL direction flips for shorts
+    if side == "long":
+        pnl_pct = (price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - price) / entry * 100
 
     # Update peak
     if pnl_pct > pos.get("peak_pnl", 0):
@@ -683,36 +812,48 @@ async def monitor_position(symbol, pos):
     # Check if still open on exchange
     still_open = await check_open_position(symbol)
     if not still_open:
-        # SL was hit by exchange
-        pnl_usd = pos["qty"] * pos["entry"] * (pnl_pct / 100)
-        result  = "win" if pnl_pct > 0 else "loss"
+        result = "win" if pnl_pct > 0 else "loss"
         await close_trade(pos, price, result, "ExchangeClose")
         return
 
-    # Check TP hit
-    if price >= pos["tp"]:
-        r = await close_order(symbol, pos["qty"], "long")
-        if r and r.get("retCode") == 0:
-            pnl_pct = (pos["tp"] - pos["entry"]) / pos["entry"] * 100
-            await close_trade(pos, pos["tp"], "win", "TP1")
-        return
+    if side == "long":
+        # Long: TP above entry, SL below entry
+        if price >= pos["tp"]:
+            r = await close_order(symbol, pos["qty"], "long")
+            if r and r.get("retCode") == 0:
+                await close_trade(pos, pos["tp"], "win", "TP1")
+            return
+        if price <= pos["sl"]:
+            r = await close_order(symbol, pos["qty"], "long")
+            if r and r.get("retCode") == 0:
+                await close_trade(pos, pos["sl"], "loss", "SL")
+            return
+    else:
+        # Short: TP below entry, SL above entry
+        if price <= pos["tp"]:
+            r = await close_order(symbol, pos["qty"], "short")
+            if r and r.get("retCode") == 0:
+                await close_trade(pos, pos["tp"], "win", "TP1")
+            return
+        if price >= pos["sl"]:
+            r = await close_order(symbol, pos["qty"], "short")
+            if r and r.get("retCode") == 0:
+                await close_trade(pos, pos["sl"], "loss", "SL")
+            return
 
-    # Check SL hit (belt-and-suspenders — exchange should handle this)
-    if price <= pos["sl"]:
-        r = await close_order(symbol, pos["qty"], "long")
-        if r and r.get("retCode") == 0:
-            pnl_pct = (pos["sl"] - pos["entry"]) / pos["entry"] * 100
-            await close_trade(pos, pos["sl"], "loss", "SL")
-        return
-
-    print(f"  HOLD {symbol} | Price={price} | "
+    print(f"  HOLD {symbol} {side.upper()} | Price={price} | "
           f"PnL={pnl_pct:+.2f}% | Peak={pos.get('peak_pnl',0):+.2f}%")
 
 async def close_trade(pos, exit_price, result, exit_type):
     symbol   = pos["symbol"]
     entry    = pos["entry"]
-    pnl_pct  = (exit_price - entry) / entry * 100
-    pnl_usd  = pos["qty"] * entry * (pnl_pct / 100)
+    side     = pos.get("side", "long")
+    # For shorts, profit is when price drops below entry
+    if side == "long":
+        pnl_pct = (exit_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - exit_price) / entry * 100
+    pnl_usd  = pos["qty"] * entry * abs(pnl_pct / 100) * (1 if result == "win" else -1)
 
     trade = {
         **pos,
@@ -868,13 +1009,20 @@ async def bot_loop():
             # Always check DD timer — this is what lifts the pause
             check_daily_dd()
 
-            # Scan for new signals
+            # Update BTC macro regime filter (cached 15 min)
+            await update_btc_regime()
+
+            # Scan for new signals — only when BTC 4h is BULL
             slots = MAX_POS - len(state["positions"])
-            if slots > 0 and not state["dd_paused"] and not state["manual_paused"]:
+            btc_ok = state["btc_regime"] in ("BULL", "UNKNOWN")
+            if slots > 0 and not state["dd_paused"] and not state["manual_paused"] and not btc_ok:
+                _log_scan(f"🛑 BTC 4h BEAR — standing down, no new entries")
+            if slots > 0 and not state["dd_paused"] and not state["manual_paused"] and btc_ok:
                 _log_scan(
                     f"Scanning {len(COINS)} coins | "
                     f"Balance=${state['balance']:.2f} | "
-                    f"Positions={len(state['positions'])}/{MAX_POS}"
+                    f"Positions={len(state['positions'])}/{MAX_POS} | "
+                    f"BTC 4h: {state['btc_regime']}"
                 )
                 for symbol in COINS:
                     if len(state["positions"]) >= MAX_POS:
@@ -1056,14 +1204,19 @@ async def dashboard():
                 lp = float(tk.get("lastPrice", pos["entry"]))
             except:
                 lp = pos["entry"]
-            pnl_pct = (lp - pos["entry"]) / pos["entry"] * 100
+            side = pos.get("side", "long")
+            if side == "long":
+                pnl_pct = (lp - pos["entry"]) / pos["entry"] * 100
+            else:
+                pnl_pct = (pos["entry"] - lp) / pos["entry"] * 100
             dur = int((time.time() - pos["open_time"]) / 60)
             col = pnl_col(pnl_pct)
+            side_label = "LONG 📈" if side == "long" else "SHORT 📉"
             pos_html += f"""
             <div class="card pos-card">
               <div class="row">
                 <b>{sym}</b>
-                <span class="badge long">LONG</span>
+                <span class="badge {'long' if side=='long' else 'short'}">{side_label}</span>
                 <span class="score-badge">TQI {pos['tqi']}</span>
               </div>
               <div class="row mt8">
@@ -1185,6 +1338,7 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 .mt8{{margin-top:8px}}.mt4{{margin-top:4px}}
 .badge{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px}}
 .long{{background:rgba(22,163,74,.1);color:#16a34a}}
+.short{{background:rgba(239,68,68,.1);color:#ef4444}}
 .score-badge{{font-size:11px;color:#ca8a04;margin-left:auto}}
 .tag{{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px}}
 .tag-blocked{{background:#fee2e2;color:#dc2626}}
@@ -1235,7 +1389,10 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
   <div class="sys-row"><span>Open Positions</span><span>{len(state['positions'])} / {MAX_POS}</span></div>
   <div class="sys-row"><span>Coins</span><span>{', '.join(c.replace('USDT','') for c in COINS)}</span></div>
   <div class="sys-row"><span>Strategy</span><span>SATS Long-Only | TQI≥{TQI_MIN}</span></div>
-  <div class="sys-row"><span>Risk/Trade</span><span>{RISK_PCT}% | SL {SL_ATR_MULT}x ATR</span></div>
+  <div class="sys-row"><span>Risk/Trade</span><span>{RISK_PCT}% (max ${MAX_RISK_USD}) | SL {SL_ATR_MULT}x ATR</span></div>
+  <div class="sys-row"><span>BTC 4h Regime</span>
+    <span style="font-weight:700;color:{'#16a34a' if state['btc_regime']=='BULL' else '#ef4444' if state['btc_regime']=='BEAR' else '#888'}">
+      {'🟢 BULL — entries ON' if state['btc_regime']=='BULL' else '🔴 BEAR — entries OFF' if state['btc_regime']=='BEAR' else '⚪ UNKNOWN'}</span></div>
   <div class="sys-row"><span>Last Scan</span><span>{age}s ago</span></div>
   <div class="sys-row"><span>DD Protection</span>
     <span style="color:{'#ef4444' if state['dd_paused'] else '#16a34a'}">
