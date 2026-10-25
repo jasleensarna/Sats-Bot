@@ -1012,17 +1012,16 @@ async def bot_loop():
             # Update BTC macro regime filter (cached 15 min)
             await update_btc_regime()
 
-            # Scan for new signals — only when BTC 4h is BULL
+            # Scan for new signals — always scan; direction gating is inside scan_symbol()
             slots = MAX_POS - len(state["positions"])
-            btc_ok = state["btc_regime"] in ("BULL", "UNKNOWN")
-            if slots > 0 and not state["dd_paused"] and not state["manual_paused"] and not btc_ok:
-                _log_scan(f"🛑 BTC 4h BEAR — standing down, no new entries")
-            if slots > 0 and not state["dd_paused"] and not state["manual_paused"] and btc_ok:
+            regime = state["btc_regime"]
+            if slots > 0 and not state["dd_paused"] and not state["manual_paused"]:
+                direction_hint = "LONG only" if regime == "BULL" else "SHORT only" if regime == "BEAR" else "LONG+SHORT"
                 _log_scan(
                     f"Scanning {len(COINS)} coins | "
                     f"Balance=${state['balance']:.2f} | "
                     f"Positions={len(state['positions'])}/{MAX_POS} | "
-                    f"BTC 4h: {state['btc_regime']}"
+                    f"BTC 4h: {regime} → {direction_hint}"
                 )
                 for symbol in COINS:
                     if len(state["positions"]) >= MAX_POS:
@@ -1392,7 +1391,7 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
   <div class="sys-row"><span>Risk/Trade</span><span>{RISK_PCT}% (max ${MAX_RISK_USD}) | SL {SL_ATR_MULT}x ATR</span></div>
   <div class="sys-row"><span>BTC 4h Regime</span>
     <span style="font-weight:700;color:{'#16a34a' if state['btc_regime']=='BULL' else '#ef4444' if state['btc_regime']=='BEAR' else '#888'}">
-      {'🟢 BULL — entries ON' if state['btc_regime']=='BULL' else '🔴 BEAR — entries OFF' if state['btc_regime']=='BEAR' else '⚪ UNKNOWN'}</span></div>
+      {'🟢 BULL — longs only' if state['btc_regime']=='BULL' else '🔴 BEAR — shorts only' if state['btc_regime']=='BEAR' else '⚪ UNKNOWN — both'}</span></div>
   <div class="sys-row"><span>Last Scan</span><span>{age}s ago</span></div>
   <div class="sys-row"><span>DD Protection</span>
     <span style="color:{'#ef4444' if state['dd_paused'] else '#16a34a'}">
