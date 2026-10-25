@@ -1,19 +1,18 @@
 """
-APEX Pro v5 — Production Bot
+APEX Pro v6 — Production Bot
 ════════════════════════════════════════════════════════════════
-Strategy: SATS Long-Only (Self-Aware Trend System)
-Signal:   Adaptive Supertrend flip up + TQI ≥ 0.63
+Strategy: SATS Bidirectional (Self-Aware Trend System)
+Signal:   Adaptive Supertrend flip + TQI filter
+          LONG  — flip UP   + TQI ≥ 0.63
+          SHORT — flip DOWN + TQI ≥ 0.68 (stricter — unproven direction)
 Coins:    SOL, XRP, DOGE, AVAX, BNB, LINK
-Direction: Long only
+Direction: Long + Short (1 trade at a time, either direction)
 Timeframe: 1h candles
-SL:        1.5x ATR below pivot low
-TP:        1R (1x risk distance)
-Risk:      5% of balance per trade (hard cap $2.50/trade)
-Max pos:   1 concurrent
+SL:        1.5x ATR below pivot low (long) / above pivot high (short)
+TP:        2R (2x risk distance)
+Risk:      5% of balance per trade, hard cap $2.50/trade
+Max pos:   1 concurrent (no double-loss events)
 Daily DD:  -10% → pause 24h
-
-Backtested: 75% WR | +3.08% exp | 4.05x PF | -9.8% DD
-            $110 → $156 over 90 days
 
 Deploy: Railway (FastAPI + uvicorn)
 Env vars needed:
@@ -39,12 +38,12 @@ BASE       = "https://api.bybit.com"
 SB_URL     = os.getenv("SUPABASE_URL", "")
 SB_KEY     = os.getenv("SUPABASE_KEY", "")
 
-COINS      = ["SOLUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","BNBUSDT","LINKUSDT"]
-MAX_POS    = 1        # max concurrent positions (1 = no double-loss events)
-RISK_PCT   = 5.0      # % of balance per trade
-MAX_RISK_USD = 2.50   # hard cap: max dollar loss per trade regardless of balance
-DAILY_DD_LIMIT = 10.0 # pause if daily drawdown exceeds this %
-SCAN_INTERVAL  = 60   # seconds between scans (1 min — faster score updates)
+COINS          = ["SOLUSDT","XRPUSDT","DOGEUSDT","AVAXUSDT","BNBUSDT","LINKUSDT"]
+MAX_POS        = 1        # max concurrent positions (1 = no double-loss events)
+RISK_PCT       = 5.0      # % of balance per trade
+MAX_RISK_USD   = 2.50     # hard cap: max dollar loss per trade regardless of balance
+DAILY_DD_LIMIT = 10.0     # pause if daily drawdown exceeds this %
+SCAN_INTERVAL  = 60       # seconds between scans
 
 # ── SATS Parameters ───────────────────────────────────────────
 ATR_LEN        = 14
@@ -53,8 +52,9 @@ ER_LEN         = 20
 SL_ATR_MULT    = 1.5
 ATR_BASELINE   = 100
 ADAPT_STRENGTH = 0.5
-TQI_MIN        = 0.63
-TP_R           = 1.0
+TQI_MIN_LONG   = 0.63     # long signal threshold
+TQI_MIN_SHORT  = 0.68     # short signal threshold (stricter — unproven)
+TP_R           = 2.0      # 2R take profit
 TQI_ER_W       = 0.35
 TQI_VOL_W      = 0.20
 TQI_STRUCT_W   = 0.25
@@ -66,28 +66,27 @@ QUAL_CURVE     = 1.5
 USE_ASYM       = True
 ASYM_STRENGTH  = 0.5
 PIVOT_LEN      = 3
-CANDLES_NEEDED = 200  # minimum candles to calculate indicators
+CANDLES_NEEDED = 200
 
 # ── STATE ────────────────────────────────────────────────────
 state = {
     "status":        "starting",
     "balance":       0.0,
-    "balance_start": 0.0,   # balance at day start for DD tracking
+    "balance_start": 0.0,
     "balance_day":   0.0,
     "dd_paused":     False,
     "dd_pause_until":0,
-    "positions":     {},     # symbol → position dict
-    "trades":        [],     # last 100 closed trades
+    "positions":     {},
+    "trades":        [],
     "wins":          0,
     "losses":        0,
     "pnl":           0.0,
-    "scan_log":      [],     # last 20 scan events
+    "scan_log":      [],
+    "scan_detail":   [],
     "last_scan":     0,
     "start_time":    int(time.time()),
     "errors":        [],
-    "manual_paused": False,  # user-controlled pause from dashboard
-    "btc_regime":    "UNKNOWN",  # BTC 4h Supertrend: BULL / BEAR / UNKNOWN
-    "btc_regime_ts": 0,          # last time BTC regime was checked
+    "manual_paused": False,
 }
 
 # ── BYBIT API ────────────────────────────────────────────────
@@ -147,38 +146,6 @@ async def get_klines(symbol, interval="60", limit=220):
         _log_error(f"get_klines {symbol}: {e}")
     return []
 
-async def update_btc_regime():
-    """
-    Fetch BTC 4h candles and compute Supertrend direction.
-    Sets state['btc_regime'] to 'BULL' or 'BEAR'.
-    Only allow new longs when BTC 4h is BULL — filters out macro dump entries.
-    Called once per loop cycle (cached for 4h between updates for efficiency).
-    """
-    now = int(time.time())
-    # Re-check at most every 15 min (4h candle closes every 4h, 15min is fine)
-    if now - state["btc_regime_ts"] < 900 and state["btc_regime"] != "UNKNOWN":
-        return
-
-    try:
-        candles = await get_klines("BTCUSDT", "240", 100)  # 4h candles
-        if len(candles) < 30:
-            return
-
-        atr_vals = _calc_atr(candles, ATR_LEN)
-        er_vals  = _calc_er([float(c[4]) for c in candles], ER_LEN)
-        vols     = [float(c[5]) for c in candles]
-        vol_z    = _calc_vol_z(vols, 20)
-        tqi_vals = _calc_tqi(candles, er_vals, vol_z)
-        st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
-
-        # -1 = BULL (price above supertrend line), 1 = BEAR
-        regime = "BULL" if st_dir[-1] == -1 else "BEAR"
-        state["btc_regime"]    = regime
-        state["btc_regime_ts"] = now
-        _log_scan(f"BTC 4h regime: {regime}")
-    except Exception as e:
-        _log_error(f"update_btc_regime: {e}")
-
 async def get_ticker(symbol):
     try:
         r = await _get("/v5/market/tickers",
@@ -189,7 +156,6 @@ async def get_ticker(symbol):
         return {}
 
 async def get_instrument(symbol):
-    """Get qty step and min order qty."""
     try:
         r = await _get("/v5/market/instruments-info",
                        {"category": "linear", "symbol": symbol})
@@ -225,7 +191,6 @@ async def close_order(symbol, qty, side):
     })
 
 async def check_open_position(symbol):
-    """Check if we actually have an open position on Bybit."""
     try:
         r = await _get("/v5/position/list",
                        {"category": "linear", "symbol": symbol},
@@ -235,7 +200,7 @@ async def check_open_position(symbol):
                 return True
         return False
     except:
-        return True  # assume open on error to be safe
+        return True
 
 def round_qty(qty, step):
     if step <= 0:
@@ -389,6 +354,7 @@ def _calc_supertrend(candles, atr_vals, er_vals, tqi_vals):
     return direction
 
 def _calc_pivots(highs, lows, pl):
+    """Find pivot lows for long SL placement."""
     n   = len(highs)
     plo = [None] * n
     for i in range(pl, n - pl):
@@ -396,10 +362,8 @@ def _calc_pivots(highs, lows, pl):
             plo[i] = lows[i]
     return plo
 
-# ── SATS SIGNAL ───────────────────────────────────────────────
-
 def _calc_pivot_highs(highs, pl):
-    """Pivot highs — mirror of _calc_pivots for lows."""
+    """Find pivot highs for short SL placement."""
     n   = len(highs)
     phi = [None] * n
     for i in range(pl, n - pl):
@@ -407,11 +371,10 @@ def _calc_pivot_highs(highs, pl):
             phi[i] = highs[i]
     return phi
 
-def compute_sats_signal(candles):
-    """
-    Returns dict with LONG signal info or None.
-    Signal = Supertrend flips BEAR→BULL AND TQI ≥ TQI_MIN
-    """
+# ── SIGNALS ───────────────────────────────────────────────────
+
+def compute_long_signal(candles):
+    """LONG: Supertrend flips BEAR→BULL + TQI ≥ 0.63"""
     if len(candles) < CANDLES_NEEDED:
         return None
 
@@ -428,13 +391,11 @@ def compute_sats_signal(candles):
     pivot_lo = _calc_pivots(highs, lows, PIVOT_LEN)
 
     i = len(candles) - 1
-
-    flip_up = st_dir[i] == -1 and st_dir[i-1] == 1
-    if not flip_up:
+    if not (st_dir[i] == -1 and st_dir[i-1] == 1):
         return None
 
     tqi = tqi_vals[i]
-    if tqi < TQI_MIN:
+    if tqi < TQI_MIN_LONG:
         return None
 
     last_pl = None
@@ -445,7 +406,6 @@ def compute_sats_signal(candles):
 
     atr   = atr_vals[i]
     price = closes[i]
-
     sl_base = last_pl if last_pl else lows[i]
     sl      = min(sl_base - SL_ATR_MULT * atr, price - SL_ATR_MULT * atr)
     risk    = price - sl
@@ -453,24 +413,19 @@ def compute_sats_signal(candles):
         return None
 
     tp = price + risk * TP_R
-
     return {
-        "side":    "long",
-        "price":   round(price, 6),
-        "sl":      round(sl, 6),
-        "tp":      round(tp, 6),
-        "risk":    round(risk, 6),
-        "atr":     round(atr, 6),
-        "tqi":     round(tqi, 3),
-        "sl_pct":  round(risk / price * 100, 3),
+        "side":   "long",
+        "price":  round(price, 6),
+        "sl":     round(sl, 6),
+        "tp":     round(tp, 6),
+        "risk":   round(risk, 6),
+        "atr":    round(atr, 6),
+        "tqi":    round(tqi, 3),
+        "sl_pct": round(risk / price * 100, 3),
     }
 
-def compute_sats_short_signal(candles):
-    """
-    Returns dict with SHORT signal info or None.
-    Signal = Supertrend flips BULL→BEAR AND TQI ≥ TQI_MIN
-    SL placed above pivot HIGH + 1.5x ATR. TP = entry - 1R.
-    """
+def compute_short_signal(candles):
+    """SHORT: Supertrend flips BULL→BEAR + TQI ≥ 0.68 (stricter)"""
     if len(candles) < CANDLES_NEEDED:
         return None
 
@@ -479,25 +434,21 @@ def compute_sats_short_signal(candles):
     lows   = [float(c[3]) for c in candles]
     vols   = [float(c[5]) for c in candles]
 
-    atr_vals = _calc_atr(candles, ATR_LEN)
-    er_vals  = _calc_er(closes, ER_LEN)
-    vol_z    = _calc_vol_z(vols, 20)
-    tqi_vals = _calc_tqi(candles, er_vals, vol_z)
-    st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
-    pivot_hi = _calc_pivot_highs(highs, PIVOT_LEN)
+    atr_vals  = _calc_atr(candles, ATR_LEN)
+    er_vals   = _calc_er(closes, ER_LEN)
+    vol_z     = _calc_vol_z(vols, 20)
+    tqi_vals  = _calc_tqi(candles, er_vals, vol_z)
+    st_dir    = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
+    pivot_hi  = _calc_pivot_highs(highs, PIVOT_LEN)
 
     i = len(candles) - 1
-
-    # Supertrend flip BULL→BEAR (direction goes from -1 to 1)
-    flip_down = st_dir[i] == 1 and st_dir[i-1] == -1
-    if not flip_down:
+    if not (st_dir[i] == 1 and st_dir[i-1] == -1):
         return None
 
     tqi = tqi_vals[i]
-    if tqi < TQI_MIN:
+    if tqi < TQI_MIN_SHORT:
         return None
 
-    # Find last pivot high for SL
     last_ph = None
     for j in range(i-1, max(0, i-50), -1):
         if pivot_hi[j] is not None:
@@ -506,32 +457,29 @@ def compute_sats_short_signal(candles):
 
     atr   = atr_vals[i]
     price = closes[i]
-
     sl_base = last_ph if last_ph else highs[i]
     sl      = max(sl_base + SL_ATR_MULT * atr, price + SL_ATR_MULT * atr)
     risk    = sl - price
     if risk <= 0:
         return None
 
-    tp = price - risk * TP_R  # profit target is below entry for shorts
-
+    tp = price - risk * TP_R
     return {
-        "side":    "short",
-        "price":   round(price, 6),
-        "sl":      round(sl, 6),
-        "tp":      round(tp, 6),
-        "risk":    round(risk, 6),
-        "atr":     round(atr, 6),
-        "tqi":     round(tqi, 3),
-        "sl_pct":  round(risk / price * 100, 3),
+        "side":   "short",
+        "price":  round(price, 6),
+        "sl":     round(sl, 6),
+        "tp":     round(tp, 6),
+        "risk":   round(risk, 6),
+        "atr":    round(atr, 6),
+        "tqi":    round(tqi, 3),
+        "sl_pct": round(risk / price * 100, 3),
     }
 
 # ── POSITION SIZING ───────────────────────────────────────────
 
 def calc_position_size(balance, sl_pct, price, step, min_qty):
-    """Risk 5% of balance, hard-capped at MAX_RISK_USD. Position = risk_amount / sl_distance."""
-    risk_amount  = min(balance * (RISK_PCT / 100), MAX_RISK_USD)  # cap at $2.50 max loss
-    sl_distance  = sl_pct / 100  # as decimal
+    risk_amount  = min(balance * (RISK_PCT / 100), MAX_RISK_USD)
+    sl_distance  = sl_pct / 100
     if sl_distance <= 0:
         return 0
     position_usd = risk_amount / sl_distance
@@ -539,13 +487,10 @@ def calc_position_size(balance, sl_pct, price, step, min_qty):
     qty          = round_qty(qty, step)
     return max(qty, min_qty)
 
-# ── DAILY DRAWDOWN PROTECTION ─────────────────────────────────
+# ── DAILY DRAWDOWN ────────────────────────────────────────────
 
 def check_daily_dd():
-    """Reset day balance at midnight, pause if DD > 10%."""
     now = int(time.time())
-
-    # Reset daily balance at start of each UTC day
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).date().toordinal()
     last  = datetime.fromtimestamp(
@@ -556,21 +501,19 @@ def check_daily_dd():
         state["balance_start"] = state["balance"]
         state["balance_day"]   = now
 
-    # Check if paused
     if state["dd_paused"]:
         if now >= state["dd_pause_until"]:
             state["dd_paused"] = False
             _log_scan("DD pause lifted — resuming trading")
         else:
-            return False  # still paused
+            return False
 
-    # Check current DD
     if state["balance_start"] > 0:
         dd = (state["balance"] - state["balance_start"]) / \
               state["balance_start"] * 100
         if dd <= -DAILY_DD_LIMIT:
-            state["dd_paused"]     = True
-            state["dd_pause_until"]= now + 24 * 3600
+            state["dd_paused"]      = True
+            state["dd_pause_until"] = now + 24 * 3600
             _log_scan(f"Daily DD limit hit ({dd:.1f}%) — pausing 24h")
             return False
 
@@ -579,36 +522,29 @@ def check_daily_dd():
 # ── HELPERS ───────────────────────────────────────────────────
 
 def _log_scan(msg):
-    state["scan_log"].insert(0, {
-        "time": int(time.time()),
-        "msg":  msg,
-    })
+    state["scan_log"].insert(0, {"time": int(time.time()), "msg": msg})
     state["scan_log"] = state["scan_log"][:25]
     print(msg)
 
 def _log_error(msg):
-    state["errors"].insert(0, {
-        "time": int(time.time()),
-        "msg":  msg,
-    })
+    state["errors"].insert(0, {"time": int(time.time()), "msg": msg})
     state["errors"] = state["errors"][:10]
     print(f"ERROR: {msg}")
 
-def _log_scan_detail(symbol, tqi, reason, er=None, st=None, flip=False):
-    """Log per-coin scan result with scores to scan_detail list."""
-    entry = {
+def _log_scan_detail(symbol, tqi, reason, er=None, st=None, flip=False, side=None):
+    state["scan_detail"].insert(0, {
         "time":   int(time.time()),
         "symbol": symbol,
         "tqi":    tqi,
         "er":     er,
         "st":     st,
         "flip":   flip,
+        "side":   side,
         "reason": reason,
-    }
-    state["scan_detail"].insert(0, entry)
+    })
     state["scan_detail"] = state["scan_detail"][:30]
 
-# ── SUPABASE LOGGING ─────────────────────────────────────────
+# ── SUPABASE ─────────────────────────────────────────────────
 
 async def sb_save(trade, result):
     if not SB_URL or not SB_KEY:
@@ -619,7 +555,7 @@ async def sb_save(trade, result):
                 f"{SB_URL}/rest/v1/trades",
                 json={
                     "symbol":     trade.get("symbol"),
-                    "direction":  "long",
+                    "direction":  trade.get("side", "long"),
                     "result":     result,
                     "entry":      trade.get("entry"),
                     "exit_price": trade.get("exit_price"),
@@ -652,32 +588,21 @@ async def sb_load():
             )
             trades = r.json()
             if isinstance(trades, list):
-                state["wins"]   = sum(1 for t in trades
-                                      if t.get("result","").lower() == "win")
-                state["losses"] = sum(1 for t in trades
-                                      if t.get("result","").lower() == "loss")
-                state["pnl"]    = round(
-                    sum(float(t.get("pnl", 0)) for t in trades), 4
-                )
-                print(f"Restored: W={state['wins']} L={state['losses']} "
-                      f"PnL=${state['pnl']:.2f}")
+                state["wins"]   = sum(1 for t in trades if t.get("result","").lower() == "win")
+                state["losses"] = sum(1 for t in trades if t.get("result","").lower() == "loss")
+                state["pnl"]    = round(sum(float(t.get("pnl", 0)) for t in trades), 4)
+                print(f"Restored: W={state['wins']} L={state['losses']} PnL=${state['pnl']:.2f}")
     except Exception as e:
         print(f"Supabase load err: {e}")
 
-# ── CORE SCAN LOGIC ───────────────────────────────────────────
+# ── CORE SCAN ─────────────────────────────────────────────────
 
 async def scan_symbol(symbol):
-    """
-    Scan one symbol for SATS signal.
-    Returns True if a trade was entered.
-    """
-    # Fetch 1h candles first so we always get scores
     candles = await get_klines(symbol, "60", 220)
     if len(candles) < CANDLES_NEEDED:
         _log_scan_detail(symbol, None, "NO DATA")
         return False
 
-    # Always compute TQI to show scores in scan log
     closes   = [float(c[4]) for c in candles]
     highs    = [float(c[2]) for c in candles]
     lows     = [float(c[3]) for c in candles]
@@ -690,80 +615,55 @@ async def scan_symbol(symbol):
     i        = len(candles) - 1
     tqi      = round(tqi_vals[i], 3)
     er       = round(er_vals[i], 3)
-    flip_up   = st_dir[i] == -1 and st_dir[i-1] == 1
-    flip_down = st_dir[i] == 1  and st_dir[i-1] == -1
-    st_state  = "BULL" if st_dir[i] == -1 else "BEAR"
+    flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
+    flip_dn  = st_dir[i] == 1  and st_dir[i-1] == -1
+    st_state = "BULL" if st_dir[i] == -1 else "BEAR"
 
-    # Skip if already in position (but still log the score)
     if symbol in state["positions"]:
-        _log_scan_detail(symbol, tqi, "IN TRADE", er=er, st=st_state, flip=flip_up)
+        _log_scan_detail(symbol, tqi, "IN TRADE", er=er, st=st_state)
         return False
 
-    # BTC regime determines direction allowed
-    btc = state.get("btc_regime", "UNKNOWN")
-    allow_long  = btc in ("BULL", "UNKNOWN")
-    allow_short = btc in ("BEAR", "UNKNOWN")
-
-    # Try LONG signal first (BTC BULL regime)
-    signal = None
-    if allow_long:
-        signal = compute_sats_signal(candles)
-
-    # Try SHORT signal if no long (BTC BEAR regime)
-    if signal is None and allow_short:
-        signal = compute_sats_short_signal(candles)
+    # Try long first, then short
+    signal = compute_long_signal(candles)
+    if signal is None:
+        signal = compute_short_signal(candles)
 
     if signal is None:
-        if flip_up and not allow_long:
-            reason = "LONG BLOCKED (BTC BEAR)"
-        elif flip_down and not allow_short:
-            reason = "SHORT BLOCKED (BTC BULL)"
-        elif flip_up or flip_down:
-            reason = "TQI LOW"
+        if flip_up:
+            reason = f"FLIP UP — TQI {tqi} < {TQI_MIN_LONG}"
+        elif flip_dn:
+            reason = f"FLIP DN — TQI {tqi} < {TQI_MIN_SHORT}"
         else:
             reason = "NO FLIP"
-        _log_scan_detail(symbol, tqi, reason, er=er, st=st_state, flip=flip_up or flip_down)
+        _log_scan_detail(symbol, tqi, reason, er=er, st=st_state,
+                         flip=flip_up or flip_dn)
         return False
 
-    side_label = "LONG 📈" if signal["side"] == "long" else "SHORT 📉"
-    _log_scan_detail(symbol, signal["tqi"], f"SIGNAL ✅ {side_label}",
-                     er=er, st=st_state, flip=True)
+    _log_scan_detail(symbol, signal["tqi"], f"SIGNAL ✅ {signal['side'].upper()}",
+                     er=er, st=st_state, flip=True, side=signal["side"])
 
-    # Check daily DD protection
     if not check_daily_dd():
         return False
 
-    # Check max positions
     if len(state["positions"]) >= MAX_POS:
         return False
 
-    # Get current balance
     if state["balance"] < 10:
         return False
 
-    # Get instrument specs
     step, min_qty = await get_instrument(symbol)
-
-    # Size the position
-    qty = calc_position_size(
-        state["balance"],
-        signal["sl_pct"],
-        signal["price"],
-        step,
-        min_qty,
-    )
+    qty = calc_position_size(state["balance"], signal["sl_pct"],
+                             signal["price"], step, min_qty)
 
     if qty < min_qty:
         _log_scan(f"  SKIP {symbol}: qty {qty} < min {min_qty}")
         return False
 
-    # Place order
     resp = await place_order(symbol, signal["side"], qty, signal["sl"])
     if not resp or resp.get("retCode") != 0:
         _log_error(f"ORDER FAIL {symbol}: {resp}")
         return False
 
-    # Record position
     state["positions"][symbol] = {
         "symbol":    symbol,
         "side":      signal["side"],
@@ -786,11 +686,9 @@ async def scan_symbol(symbol):
     await sb_save(state["positions"][symbol], "open")
     return True
 
+# ── POSITION MONITOR ─────────────────────────────────────────
+
 async def monitor_position(symbol, pos):
-    """
-    Monitor an open position.
-    Check if TP or SL hit via live ticker.
-    """
     ticker = await get_ticker(symbol)
     if not ticker:
         return
@@ -799,17 +697,14 @@ async def monitor_position(symbol, pos):
     side  = pos.get("side", "long")
     entry = pos["entry"]
 
-    # PnL direction flips for shorts
     if side == "long":
         pnl_pct = (price - entry) / entry * 100
     else:
         pnl_pct = (entry - price) / entry * 100
 
-    # Update peak
     if pnl_pct > pos.get("peak_pnl", 0):
         pos["peak_pnl"] = round(pnl_pct, 3)
 
-    # Check if still open on exchange
     still_open = await check_open_position(symbol)
     if not still_open:
         result = "win" if pnl_pct > 0 else "loss"
@@ -817,7 +712,6 @@ async def monitor_position(symbol, pos):
         return
 
     if side == "long":
-        # Long: TP above entry, SL below entry
         if price >= pos["tp"]:
             r = await close_order(symbol, pos["qty"], "long")
             if r and r.get("retCode") == 0:
@@ -829,7 +723,6 @@ async def monitor_position(symbol, pos):
                 await close_trade(pos, pos["sl"], "loss", "SL")
             return
     else:
-        # Short: TP below entry, SL above entry
         if price <= pos["tp"]:
             r = await close_order(symbol, pos["qty"], "short")
             if r and r.get("retCode") == 0:
@@ -845,15 +738,16 @@ async def monitor_position(symbol, pos):
           f"PnL={pnl_pct:+.2f}% | Peak={pos.get('peak_pnl',0):+.2f}%")
 
 async def close_trade(pos, exit_price, result, exit_type):
-    symbol   = pos["symbol"]
-    entry    = pos["entry"]
-    side     = pos.get("side", "long")
-    # For shorts, profit is when price drops below entry
+    symbol = pos["symbol"]
+    entry  = pos["entry"]
+    side   = pos.get("side", "long")
+
     if side == "long":
         pnl_pct = (exit_price - entry) / entry * 100
     else:
         pnl_pct = (entry - exit_price) / entry * 100
-    pnl_usd  = pos["qty"] * entry * abs(pnl_pct / 100) * (1 if result == "win" else -1)
+
+    pnl_usd = pos["qty"] * entry * abs(pnl_pct / 100) * (1 if result == "win" else -1)
 
     trade = {
         **pos,
@@ -877,31 +771,80 @@ async def close_trade(pos, exit_price, result, exit_type):
 
     _log_scan(
         f"  {'✅ WIN' if result=='win' else '❌ LOSS'} "
-        f"{symbol} | {pnl_pct:+.2f}% | ${pnl_usd:+.2f} | {exit_type}"
+        f"{symbol} {side.upper()} | {pnl_pct:+.2f}% | ${pnl_usd:+.2f} | {exit_type}"
     )
     await sb_save(trade, result)
 
-# ── TOGGLE ENDPOINT ─────────────────────────────────────────
+# ── API ENDPOINTS ────────────────────────────────────────────
 
 @app.post("/api/reset_dd")
 async def reset_dd():
-    """Manually clear the DD pause — use if timer gets stuck."""
     state["dd_paused"]      = False
     state["dd_pause_until"] = 0
     state["balance_start"]  = state["balance"]
     _log_scan("DD pause manually cleared via dashboard")
     return {"ok": True, "msg": "DD pause cleared"}
 
+@app.post("/api/toggle")
+async def toggle_bot():
+    state["manual_paused"] = not state["manual_paused"]
+    status = "paused" if state["manual_paused"] else "running"
+    state["status"] = status
+    _log_scan(f"Bot manually {'PAUSED' if state['manual_paused'] else 'RESUMED'} via dashboard")
+    return {"paused": state["manual_paused"], "status": status}
+
+@app.get("/api/health")
+async def health():
+    return {
+        "ok":        True,
+        "status":    state["status"],
+        "balance":   state["balance"],
+        "positions": len(state["positions"]),
+        "uptime":    int(time.time()) - state["start_time"],
+        "dd_paused": state["dd_paused"],
+    }
+
+@app.get("/api/status")
+async def api_status():
+    pos_data = {}
+    for sym, pos in state["positions"].items():
+        try:
+            tk = await asyncio.wait_for(get_ticker(sym), timeout=3)
+            lp = float(tk.get("lastPrice", pos["entry"]))
+            side = pos.get("side", "long")
+            pnl = (lp - pos["entry"]) / pos["entry"] * 100 if side == "long" \
+                  else (pos["entry"] - lp) / pos["entry"] * 100
+            pos_data[sym] = {**pos, "live_price": round(lp, 6),
+                             "live_pnl": round(pnl, 3)}
+        except:
+            pos_data[sym] = {**pos, "live_price": pos["entry"], "live_pnl": 0.0}
+
+    total = state["wins"] + state["losses"]
+    return JSONResponse({
+        "status":    state["status"],
+        "balance":   state["balance"],
+        "wins":      state["wins"],
+        "losses":    state["losses"],
+        "win_rate":  round(state["wins"]/total*100, 1) if total > 0 else 0,
+        "pnl":       round(state["pnl"], 2),
+        "positions": pos_data,
+        "trades":    state["trades"][-30:],
+        "scan_log":  state["scan_log"][:15],
+        "last_scan": state["last_scan"],
+        "dd_paused": state["dd_paused"],
+        "errors":    state["errors"][:5],
+        "now":       int(time.time()),
+    })
+
 @app.get("/api/score/{symbol}")
 async def get_score(symbol: str):
-    """Calculate SATS scores for any coin on demand."""
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
+        symbol += "USDT"
     try:
         candles = await get_klines(symbol, "60", 220)
         if len(candles) < 50:
-            return JSONResponse({"error": f"Not enough data for {symbol} — only {len(candles)} candles"})
+            return JSONResponse({"error": f"Not enough data for {symbol}"})
 
         closes = [float(c[4]) for c in candles]
         highs  = [float(c[2]) for c in candles]
@@ -923,28 +866,38 @@ async def get_score(symbol: str):
         st_state = "BULL" if st_dir[i] == -1 else "BEAR"
         price    = closes[i]
 
-        # SL/TP if signal
         pivot_lo = _calc_pivots(highs, lows, PIVOT_LEN)
-        last_pl  = next((pivot_lo[j] for j in range(i-1, max(0,i-50), -1)
-                         if pivot_lo[j] is not None), None)
-        sl = tp = risk_pct = None
-        if flip_up and tqi >= TQI_MIN:
-            sl_base = last_pl if last_pl else lows[i]
-            sl      = min(sl_base - SL_ATR_MULT*atr_vals[i], price - SL_ATR_MULT*atr_vals[i])
-            risk    = price - sl
-            tp      = price + risk * TP_R
-            risk_pct= round(risk/price*100, 3)
+        pivot_hi = _calc_pivot_highs(highs, PIVOT_LEN)
 
-        if flip_up and tqi >= TQI_MIN:
-            signal = "✅ LONG SIGNAL"
+        sl = tp = risk_pct = signal = None
+        if flip_up and tqi >= TQI_MIN_LONG:
+            last_pl = next((pivot_lo[j] for j in range(i-1, max(0,i-50), -1)
+                            if pivot_lo[j] is not None), None)
+            sl_base = last_pl if last_pl else lows[i]
+            sl_val  = min(sl_base - SL_ATR_MULT*atr_vals[i], price - SL_ATR_MULT*atr_vals[i])
+            risk    = price - sl_val
+            sl      = round(sl_val, 8)
+            tp      = round(price + risk * TP_R, 8)
+            risk_pct= round(risk/price*100, 3)
+            signal  = "✅ LONG SIGNAL"
+        elif flip_dn and tqi >= TQI_MIN_SHORT:
+            last_ph = next((pivot_hi[j] for j in range(i-1, max(0,i-50), -1)
+                            if pivot_hi[j] is not None), None)
+            sl_base = last_ph if last_ph else highs[i]
+            sl_val  = max(sl_base + SL_ATR_MULT*atr_vals[i], price + SL_ATR_MULT*atr_vals[i])
+            risk    = sl_val - price
+            sl      = round(sl_val, 8)
+            tp      = round(price - risk * TP_R, 8)
+            risk_pct= round(risk/price*100, 3)
+            signal  = "✅ SHORT SIGNAL"
         elif flip_up:
-            signal = f"⚠️ FLIP UP but TQI {tqi} < {TQI_MIN}"
+            signal = f"⚠️ FLIP UP — TQI {tqi} < {TQI_MIN_LONG}"
         elif flip_dn:
-            signal = "🔻 FLIPPED BEAR"
+            signal = f"⚠️ FLIP DN — TQI {tqi} < {TQI_MIN_SHORT}"
         elif st_state == "BULL":
             signal = "📈 BULL — waiting for next flip"
         else:
-            signal = "📉 BEAR — no signal"
+            signal = "📉 BEAR — waiting for next flip"
 
         return JSONResponse({
             "symbol":   symbol,
@@ -957,138 +910,14 @@ async def get_score(symbol: str):
             "flip_up":  flip_up,
             "flip_dn":  flip_dn,
             "signal":   signal,
-            "tqi_pass": tqi >= TQI_MIN,
-            "sl":       round(sl, 8) if sl else None,
-            "tp":       round(tp, 8) if tp else None,
+            "long_pass": tqi >= TQI_MIN_LONG,
+            "short_pass": tqi >= TQI_MIN_SHORT,
+            "sl":       sl,
+            "tp":       tp,
             "risk_pct": risk_pct,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)})
-
-@app.post("/api/toggle")
-async def toggle_bot():
-    state["manual_paused"] = not state["manual_paused"]
-    status = "paused" if state["manual_paused"] else "running"
-    state["status"] = status
-    _log_scan(f"Bot manually {'PAUSED' if state['manual_paused'] else 'RESUMED'} via dashboard")
-    return {"paused": state["manual_paused"], "status": status}
-
-# ── MAIN BOT LOOP ────────────────────────────────────────────
-
-async def bot_loop():
-    print("APEX Pro v5 starting...")
-    # Ensure all state keys exist (safe for hot-reloads)
-    state.setdefault("manual_paused", False)
-    state.setdefault("scan_detail", [])
-    await sb_load()
-
-    state["balance"]       = await get_balance()
-    state["balance_start"] = state["balance"]
-    state["balance_day"]   = int(time.time())
-    state["status"]        = "running"
-
-    print(f"Balance: ${state['balance']:.2f}")
-
-    while True:
-        try:
-            state["last_scan"] = int(time.time())
-
-            # Refresh balance
-            bal = await get_balance()
-            if bal > 0:
-                state["balance"] = bal
-
-            # Monitor existing positions
-            if state["positions"]:
-                tasks = [
-                    monitor_position(sym, pos)
-                    for sym, pos in list(state["positions"].items())
-                ]
-                await asyncio.gather(*tasks)
-
-            # Always check DD timer — this is what lifts the pause
-            check_daily_dd()
-
-            # Update BTC macro regime filter (cached 15 min)
-            await update_btc_regime()
-
-            # Scan for new signals — always scan; direction gating is inside scan_symbol()
-            slots = MAX_POS - len(state["positions"])
-            regime = state["btc_regime"]
-            if slots > 0 and not state["dd_paused"] and not state["manual_paused"]:
-                direction_hint = "LONG only" if regime == "BULL" else "SHORT only" if regime == "BEAR" else "LONG+SHORT"
-                _log_scan(
-                    f"Scanning {len(COINS)} coins | "
-                    f"Balance=${state['balance']:.2f} | "
-                    f"Positions={len(state['positions'])}/{MAX_POS} | "
-                    f"BTC 4h: {regime} → {direction_hint}"
-                )
-                for symbol in COINS:
-                    if len(state["positions"]) >= MAX_POS:
-                        break
-                    try:
-                        entered = await scan_symbol(symbol)
-                        if not entered:
-                            pass  # normal — most scans find nothing
-                    except Exception as e:
-                        _log_error(f"scan {symbol}: {e}")
-                    await asyncio.sleep(1)  # rate limit between coins
-
-        except Exception as e:
-            _log_error(f"bot_loop: {e}")
-
-        await asyncio.sleep(SCAN_INTERVAL)
-
-# ── STARTUP ───────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(bot_loop())
-
-# ── API ENDPOINTS ─────────────────────────────────────────────
-
-@app.get("/api/health")
-async def health():
-    return {
-        "ok":        True,
-        "status":    state["status"],
-        "balance":   state["balance"],
-        "positions": len(state["positions"]),
-        "uptime":    int(time.time()) - state["start_time"],
-        "dd_paused": state["dd_paused"],
-    }
-
-@app.get("/api/status")
-async def api_status():
-    # Live P&L for open positions
-    pos_data = {}
-    for sym, pos in state["positions"].items():
-        try:
-            tk = await asyncio.wait_for(get_ticker(sym), timeout=3)
-            lp = float(tk.get("lastPrice", pos["entry"]))
-            pnl = (lp - pos["entry"]) / pos["entry"] * 100
-            pos_data[sym] = {**pos, "live_price": round(lp, 6),
-                             "live_pnl": round(pnl, 3)}
-        except:
-            pos_data[sym] = {**pos, "live_price": pos["entry"],
-                             "live_pnl": 0.0}
-
-    total = state["wins"] + state["losses"]
-    return JSONResponse({
-        "status":    state["status"],
-        "balance":   state["balance"],
-        "wins":      state["wins"],
-        "losses":    state["losses"],
-        "win_rate":  round(state["wins"]/total*100, 1) if total > 0 else 0,
-        "pnl":       round(state["pnl"], 2),
-        "positions": pos_data,
-        "trades":    state["trades"][-30:],
-        "scan_log":  state["scan_log"][:15],
-        "last_scan": state["last_scan"],
-        "dd_paused": state["dd_paused"],
-        "errors":    state["errors"][:5],
-        "now":       int(time.time()),
-    })
 
 @app.get("/api/debug/balance")
 async def debug_balance():
@@ -1102,94 +931,20 @@ async def debug_balance():
             results[acct] = {"error": str(e)}
     return JSONResponse(results)
 
-# ── COIN CHECKER ─────────────────────────────────────────────
-
-@app.get("/api/check/{symbol}")
-async def check_coin(symbol: str):
-    """Calculate SATS scores for any coin on demand."""
-    symbol = symbol.upper()
-    if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
-
-    candles = await get_klines(symbol, "60", 220)
-    if not candles or len(candles) < 50:
-        return JSONResponse({"error": f"Not enough data for {symbol} ({len(candles)} candles)"})
-
-    closes = [float(c[4]) for c in candles]
-    highs  = [float(c[2]) for c in candles]
-    lows   = [float(c[3]) for c in candles]
-    vols   = [float(c[5]) for c in candles]
-
-    atr_vals = _calc_atr(candles, ATR_LEN)
-    er_vals  = _calc_er(closes, ER_LEN)
-    vol_z    = _calc_vol_z(vols, 20)
-    tqi_vals = _calc_tqi(candles, er_vals, vol_z)
-    st_dir   = _calc_supertrend(candles, atr_vals, er_vals, tqi_vals)
-
-    i        = len(candles) - 1
-    tqi      = round(tqi_vals[i], 3)
-    er       = round(er_vals[i], 3)
-    atr      = round(atr_vals[i], 8)
-    price    = round(closes[i], 8)
-    flip_up  = st_dir[i] == -1 and st_dir[i-1] == 1
-    flip_dn  = st_dir[i] == 1  and st_dir[i-1] == -1
-    st_state = "BULL" if st_dir[i] == -1 else "BEAR"
-
-    # SL/TP if signal fired
-    sl = tp = risk_pct = None
-    if flip_up and tqi >= TQI_MIN:
-        atr_v  = atr_vals[i]
-        sl_val = price - SL_ATR_MULT * atr_v
-        risk   = price - sl_val
-        tp_val = price + risk * TP_R
-        sl     = round(sl_val, 8)
-        tp     = round(tp_val, 8)
-        risk_pct = round(risk / price * 100, 3)
-
-    if flip_up and tqi >= TQI_MIN:
-        status = "SIGNAL ✅"
-    elif flip_up:
-        status = f"FLIP but TQI {tqi} < 0.6 — blocked"
-    elif flip_dn:
-        status = "Flipped BEAR — no entry"
-    elif st_state == "BULL" and tqi >= TQI_MIN:
-        status = "BULL trend, TQI OK — waiting for flip"
-    elif tqi < TQI_MIN:
-        status = f"TQI {tqi} too low — choppy market"
-    else:
-        status = "No signal"
-
-    return JSONResponse({
-        "symbol":   symbol,
-        "price":    price,
-        "candles":  len(candles),
-        "st":       st_state,
-        "tqi":      tqi,
-        "er":       er,
-        "atr":      atr,
-        "flip":     "BULL" if flip_up else "BEAR" if flip_dn else "NONE",
-        "tqi_pass": tqi >= TQI_MIN,
-        "status":   status,
-        "sl":       sl,
-        "tp":       tp,
-        "risk_pct": risk_pct,
-    })
-
 # ── DASHBOARD ─────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    total = state["wins"] + state["losses"]
-    wr    = f"{state['wins']/total*100:.0f}%" if total > 0 else "—"
-    pnl   = state["pnl"]
-    bal   = state["balance"]
-
-    trades = state["trades"]
+    total    = state["wins"] + state["losses"]
+    wr       = f"{state['wins']/total*100:.0f}%" if total > 0 else "—"
+    pnl      = state["pnl"]
+    bal      = state["balance"]
+    trades   = state["trades"]
     avg_win  = (sum(t["pnl"] for t in trades if t.get("result")=="win") /
                 max(state["wins"],1))
     avg_loss = (sum(t["pnl"] for t in trades if t.get("result")=="loss") /
                 max(state["losses"],1))
-    age = int(time.time()) - state["last_scan"] if state["last_scan"] > 0 else "?"
+    age      = int(time.time()) - state["last_scan"] if state["last_scan"] > 0 else "?"
 
     def pnl_col(v): return "#22c55e" if v >= 0 else "#ef4444"
     def fmt(v, d=2): return f"{v:.{d}f}"
@@ -1208,14 +963,15 @@ async def dashboard():
                 pnl_pct = (lp - pos["entry"]) / pos["entry"] * 100
             else:
                 pnl_pct = (pos["entry"] - lp) / pos["entry"] * 100
-            dur = int((time.time() - pos["open_time"]) / 60)
-            col = pnl_col(pnl_pct)
+            dur       = int((time.time() - pos["open_time"]) / 60)
+            col       = pnl_col(pnl_pct)
             side_label = "LONG 📈" if side == "long" else "SHORT 📉"
+            side_color = "#16a34a" if side == "long" else "#ef4444"
             pos_html += f"""
-            <div class="card pos-card">
+            <div class="card pos-card" style="border-left-color:{side_color}">
               <div class="row">
                 <b>{sym}</b>
-                <span class="badge {'long' if side=='long' else 'short'}">{side_label}</span>
+                <span class="badge" style="background:{'rgba(22,163,74,.1)' if side=='long' else 'rgba(239,68,68,.1)'};color:{side_color}">{side_label}</span>
                 <span class="score-badge">TQI {pos['tqi']}</span>
               </div>
               <div class="row mt8">
@@ -1251,12 +1007,14 @@ async def dashboard():
     # Trades HTML
     trades_html = ""
     for t in reversed(state["trades"][-12:]):
-        p   = t.get("pnl", 0)
-        col = pnl_col(p)
-        res = t.get("result","")
+        p    = t.get("pnl", 0)
+        col  = pnl_col(p)
+        res  = t.get("result","")
+        side = t.get("side","long")
         trades_html += f"""
         <div class="log-row">
           <span class="sym">{t.get('symbol','').replace('USDT','')}</span>
+          <span style="font-size:10px;color:{'#16a34a' if side=='long' else '#ef4444'};font-weight:600">{'▲' if side=='long' else '▼'}{side.upper()}</span>
           <span style="font-size:11px;color:#888">{t.get('exit_type','')}</span>
           <span style="color:{col};font-weight:700;margin-left:auto">
             {'+' if p>=0 else ''}${fmt(abs(p))}</span>
@@ -1267,17 +1025,16 @@ async def dashboard():
         trades_html = '<div class="empty">No trades yet</div>'
 
     dd_warning = ""
-    # Pre-compute toggle values (avoid nested quotes in f-string)
-    is_paused     = state["manual_paused"]
-    btn_class     = "toggle-btn btn-pause" if not is_paused else "toggle-btn btn-resume"
-    btn_label     = "⏸  PAUSE BOT" if not is_paused else "▶  RESUME BOT"
+    is_paused  = state["manual_paused"]
+    btn_class  = "toggle-btn btn-pause" if not is_paused else "toggle-btn btn-resume"
+    btn_label  = "⏸  PAUSE BOT" if not is_paused else "▶  RESUME BOT"
     if state["dd_paused"]:
         resume = state["dd_pause_until"] - int(time.time())
         dd_warning = f'<div class="dd-warning">⚠️ Daily DD limit hit — paused {resume//3600:.0f}h {(resume%3600)//60:.0f}m</div>'
     if state["manual_paused"]:
         dd_warning += '<div class="manual-warning">⏸ Bot manually paused — click RESUME to restart scanning</div>'
 
-    # Build scan detail log HTML
+    # Scan detail HTML
     scan_detail_html = ""
     for s in state.get("scan_detail", [])[:15]:
         age_s   = int(time.time()) - s.get("time", int(time.time()))
@@ -1288,15 +1045,17 @@ async def dashboard():
         reason  = s.get("reason","")
         st      = s.get("st","")
         flip    = s.get("flip", False)
+        sig_side= s.get("side")
         tqi_str = f"{tqi:.3f}" if tqi is not None else "—"
         er_str  = f"{er:.3f}" if er is not None else "—"
         if "SIGNAL" in reason:
-            row_col = "#16a34a"; bg = "#f0fdf4"
+            row_col = "#16a34a" if "LONG" in reason else "#ef4444"
+            bg = "#f0fdf4" if "LONG" in reason else "#fef2f2"
         elif flip:
             row_col = "#ca8a04"; bg = "#fefce8"
         else:
             row_col = "#888"; bg = "transparent"
-        tqi_col = "#16a34a" if tqi and tqi >= 0.6 else "#ef4444" if tqi else "#888"
+        tqi_col = "#16a34a" if tqi and tqi >= TQI_MIN_LONG else "#ef4444" if tqi else "#888"
         scan_detail_html += f'''
         <div class="scan-row" style="background:{bg}">
           <span class="scan-sym">{sym}</span>
@@ -1313,7 +1072,7 @@ async def dashboard():
 <html><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>APEX Pro v5</title>
+<title>APEX Pro v6</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;max-width:480px;margin:0 auto}}
@@ -1324,8 +1083,12 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 .status{{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:#16a34a}}
 .dot{{width:7px;height:7px;background:#16a34a;border-radius:50%;animation:pulse 1.5s infinite}}
 .dd-warning{{background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#92400e}}
+.manual-warning{{background:#fee2e2;border:1px solid #ef4444;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#991b1b;margin-top:8px}}
 @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}}
+.toggle-btn{{width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px}}
+.btn-pause{{background:#1a1a1a;color:#fff}}
+.btn-resume{{background:#16a34a;color:#fff}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;margin-top:16px}}
 .card{{background:#fff;border-radius:12px;padding:14px;border:1px solid #e5e5e5}}
 .card-label{{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#888;margin-bottom:6px}}
 .card-val{{font-size:22px;font-weight:700;font-family:'Courier New',monospace}}
@@ -1336,31 +1099,35 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 .row{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px}}
 .mt8{{margin-top:8px}}.mt4{{margin-top:4px}}
 .badge{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px}}
-.long{{background:rgba(22,163,74,.1);color:#16a34a}}
-.short{{background:rgba(239,68,68,.1);color:#ef4444}}
 .score-badge{{font-size:11px;color:#ca8a04;margin-left:auto}}
 .tag{{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px}}
 .tag-blocked{{background:#fee2e2;color:#dc2626}}
 .tag-signal{{background:#dcfce7;color:#16a34a}}
 .log-row{{display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid #f0f0f0;flex-wrap:wrap}}
 .log-row:last-child{{border-bottom:none}}
-.sym{{font-weight:700;font-size:13px;min-width:60px}}
+.sym{{font-weight:700;font-size:13px;min-width:50px}}
 .age{{font-size:11px;color:#aaa;margin-left:auto}}
 .empty{{text-align:center;padding:20px;color:#aaa;font-size:13px}}
 .sys-row{{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:13px}}
 .sys-row:last-child{{border-bottom:none}}
 .sys-row span:first-child{{color:#888}}
 .sys-row span:last-child{{font-weight:600}}
+.scan-row{{display:flex;align-items:center;gap:8px;padding:7px 6px;border-radius:6px;margin-bottom:2px;flex-wrap:wrap}}
+.scan-sym{{font-weight:700;font-size:12px;min-width:38px}}
+.scan-st{{min-width:32px}}
+.scan-tqi{{font-size:12px;min-width:70px}}
+.scan-er{{min-width:52px}}
+.scan-reason{{flex:1}}
 .refresh{{text-align:center;margin-top:20px;font-size:11px;color:#aaa}}
 </style>
 </head><body>
 <div class="header">
-  <div class="logo">APEX <span>Pro</span><small>v5</small></div>
+  <div class="logo">APEX <span>Pro</span><small>v6</small></div>
   <div class="status"><span class="dot"></span>{state["status"].upper()}</div>
 </div>
 {dd_warning}
 <button class="{btn_class}" onclick="fetch('/api/toggle',{{method:'POST'}}).then(()=>location.reload())">{btn_label}</button>
-<button class="toggle-btn" style="background:#f59e0b;color:#fff;margin-top:8px" onclick="fetch('/api/reset_dd',{{method:'POST'}}).then(()=>location.reload())">🔓 CLEAR DD PAUSE</button>
+<button class="toggle-btn" style="background:#f59e0b;color:#fff" onclick="fetch('/api/reset_dd',{{method:'POST'}}).then(()=>location.reload())">🔓 CLEAR DD PAUSE</button>
 <div class="grid">
   <div class="card">
     <div class="card-label">Total P&L</div>
@@ -1387,11 +1154,9 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
   <div class="sys-row"><span>Balance</span><span>${fmt(bal)} USDT</span></div>
   <div class="sys-row"><span>Open Positions</span><span>{len(state['positions'])} / {MAX_POS}</span></div>
   <div class="sys-row"><span>Coins</span><span>{', '.join(c.replace('USDT','') for c in COINS)}</span></div>
-  <div class="sys-row"><span>Strategy</span><span>SATS Long-Only | TQI≥{TQI_MIN}</span></div>
-  <div class="sys-row"><span>Risk/Trade</span><span>{RISK_PCT}% (max ${MAX_RISK_USD}) | SL {SL_ATR_MULT}x ATR</span></div>
-  <div class="sys-row"><span>BTC 4h Regime</span>
-    <span style="font-weight:700;color:{'#16a34a' if state['btc_regime']=='BULL' else '#ef4444' if state['btc_regime']=='BEAR' else '#888'}">
-      {'🟢 BULL — longs only' if state['btc_regime']=='BULL' else '🔴 BEAR — shorts only' if state['btc_regime']=='BEAR' else '⚪ UNKNOWN — both'}</span></div>
+  <div class="sys-row"><span>Strategy</span><span>LONG TQI≥{TQI_MIN_LONG} | SHORT TQI≥{TQI_MIN_SHORT}</span></div>
+  <div class="sys-row"><span>TP / SL</span><span>2R TP | 1.5x ATR SL</span></div>
+  <div class="sys-row"><span>Risk/Trade</span><span>{RISK_PCT}% capped at ${MAX_RISK_USD}</span></div>
   <div class="sys-row"><span>Last Scan</span><span>{age}s ago</span></div>
   <div class="sys-row"><span>DD Protection</span>
     <span style="color:{'#ef4444' if state['dd_paused'] else '#16a34a'}">
@@ -1408,7 +1173,7 @@ body{{background:#f5f2ed;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemF
 <div class="sec-title">Coin Score Checker</div>
 <div class="card">
   <div style="display:flex;gap:8px;margin-bottom:12px">
-    <input id="coinInput" type="text" placeholder="e.g. B3, SOL, AVAX"
+    <input id="coinInput" type="text" placeholder="e.g. BTC, SOL, AVAX"
       style="flex:1;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px;
              font-size:14px;outline:none;font-family:inherit"
       onkeydown="if(event.key==='Enter')checkCoin()">
@@ -1436,10 +1201,10 @@ async function checkCoin() {{
       el.innerHTML = '<span style="color:#ef4444">⚠️ ' + d.error + '</span>';
       return;
     }}
-    const tqiCol  = d.tqi_pass ? '#16a34a' : '#ef4444';
-    const stCol   = d.st === 'BULL' ? '#16a34a' : '#ef4444';
-    const sigCol  = d.signal.includes('✅') ? '#16a34a' :
-                    d.signal.includes('⚠️') ? '#ca8a04' : '#ef4444';
+    const tqiCol = d.long_pass ? '#16a34a' : d.short_pass ? '#ca8a04' : '#ef4444';
+    const stCol  = d.st === 'BULL' ? '#16a34a' : '#ef4444';
+    const sigCol = d.signal && d.signal.includes('✅') ? '#16a34a' :
+                   d.signal && d.signal.includes('⚠️') ? '#ca8a04' : '#888';
     let html = '<div style="border-top:1px solid #f0f0f0;padding-top:10px">';
     html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px">';
     html += '<b style="font-size:15px">' + d.symbol + '</b>';
@@ -1452,7 +1217,7 @@ async function checkCoin() {{
     html += '</div></div>';
     html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">TQI</span>';
     html += '<div style="font-weight:700;font-size:18px;color:' + tqiCol + '">' + d.tqi;
-    html += '<span style="font-size:11px;margin-left:4px">' + (d.tqi_pass ? '✓ PASS' : '✗ LOW') + '</span></div></div>';
+    html += '<span style="font-size:11px;margin-left:4px">' + (d.long_pass ? '✓ LONG OK' : d.short_pass ? '✓ SHORT OK' : '✗ LOW') + '</span></div></div>';
     html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">ER</span>';
     html += '<div style="font-weight:600">' + d.er + '<span style="color:#888;font-size:11px;margin-left:4px">' + (d.er > 0.4 ? 'trending' : 'choppy') + '</span></div></div>';
     html += '<div><span style="color:#888;font-size:10px;text-transform:uppercase">Price</span>';
@@ -1476,6 +1241,62 @@ async function checkCoin() {{
 </body></html>"""
 
     return HTMLResponse(html)
+
+# ── MAIN BOT LOOP ────────────────────────────────────────────
+
+async def bot_loop():
+    print("APEX Pro v6 starting...")
+    state.setdefault("manual_paused", False)
+    state.setdefault("scan_detail", [])
+    await sb_load()
+
+    state["balance"]       = await get_balance()
+    state["balance_start"] = state["balance"]
+    state["balance_day"]   = int(time.time())
+    state["status"]        = "running"
+    print(f"Balance: ${state['balance']:.2f}")
+
+    while True:
+        try:
+            state["last_scan"] = int(time.time())
+
+            bal = await get_balance()
+            if bal > 0:
+                state["balance"] = bal
+
+            if state["positions"]:
+                tasks = [monitor_position(sym, pos)
+                         for sym, pos in list(state["positions"].items())]
+                await asyncio.gather(*tasks)
+
+            check_daily_dd()
+
+            slots = MAX_POS - len(state["positions"])
+            if slots > 0 and not state["dd_paused"] and not state["manual_paused"]:
+                _log_scan(
+                    f"Scanning {len(COINS)} coins | "
+                    f"Balance=${state['balance']:.2f} | "
+                    f"Positions={len(state['positions'])}/{MAX_POS}"
+                )
+                for symbol in COINS:
+                    if len(state["positions"]) >= MAX_POS:
+                        break
+                    try:
+                        await scan_symbol(symbol)
+                    except Exception as e:
+                        _log_error(f"scan {symbol}: {e}")
+                    await asyncio.sleep(1)
+
+        except Exception as e:
+            _log_error(f"bot_loop: {e}")
+
+        await asyncio.sleep(SCAN_INTERVAL)
+
+# ── STARTUP ───────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(bot_loop())
 
 # ── ENTRY POINT ───────────────────────────────────────────────
 
